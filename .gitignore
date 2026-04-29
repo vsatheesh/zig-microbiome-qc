@@ -1,0 +1,26 @@
+# Zig
+zig-out/
+zig-cache/
+.zig-cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Outputs
+*.tsv
+*.csv
+*.html
+*.log
+
+# Sequencing / large files
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.bai
+*.sam
+*.qza
+*.qzv
