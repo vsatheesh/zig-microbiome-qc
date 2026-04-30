@@ -74,10 +74,29 @@ const Recommendation = enum {
 const NA_F64: f64 = -1.0;
 const NA_U64: u64 = std.math.maxInt(u64);
 
-const Sample = struct {
+const ReadSide = enum {
+    unknown,
+    r1,
+    r2,
+
+    fn label(self: ReadSide) []const u8 {
+        return switch (self) {
+            .unknown => "unknown",
+            .r1 => "R1",
+            .r2 => "R2",
+        };
+    }
+};
+
+const NormalizedSampleId = struct {
+    base: []const u8,
+    read_side: ReadSide,
+};
+
+const MultiqcFileRow = struct {
     id: []const u8,
     base_id: []const u8,
-    is_r1: bool,
+    read_side: ReadSide = .unknown,
     // MultiQC general stats
     pct_duplicates: f64 = NA_F64,
     pct_gc: f64 = NA_F64,
@@ -97,7 +116,63 @@ const Sample = struct {
     seq_duplication_levels: u8 = 255,
     overrepresented_seqs: u8 = 255,
     adapter_content: u8 = 255,
+};
+
+const MetricAgg = struct {
+    weighted_sum: f64 = 0.0,
+    weight_sum: f64 = 0.0,
+    sum: f64 = 0.0,
+    count: usize = 0,
+
+    fn add(self: *MetricAgg, metric_value: f64, weight: f64) void {
+        if (metric_value == NA_F64) return;
+        self.sum += metric_value;
+        self.count += 1;
+        if (weight != NA_F64 and weight > 0.0) {
+            self.weighted_sum += metric_value * weight;
+            self.weight_sum += weight;
+        }
+    }
+
+    fn value(self: MetricAgg) f64 {
+        if (self.weight_sum > 0.0) return self.weighted_sum / self.weight_sum;
+        if (self.count > 0) return self.sum / @as(f64, @floatFromInt(self.count));
+        return NA_F64;
+    }
+};
+
+const SampleRecord = struct {
+    id: []const u8,
+    file_count: usize = 0,
+    seen_r1: bool = false,
+    seen_r2: bool = false,
+    seen_unknown_read: bool = false,
+    // MultiQC general stats aggregated to biological sample level.
+    pct_duplicates: f64 = NA_F64,
+    pct_gc: f64 = NA_F64,
+    avg_seq_len: f64 = NA_F64,
+    median_seq_len: f64 = NA_F64,
+    pct_fails: f64 = NA_F64,
+    total_sequences: f64 = NA_F64,
+    pct_duplicates_agg: MetricAgg = .{},
+    pct_gc_agg: MetricAgg = .{},
+    avg_seq_len_agg: MetricAgg = .{},
+    median_seq_len_agg: MetricAgg = .{},
+    pct_fails_agg: MetricAgg = .{},
+    // FastQC module statuses aggregated by worst observed status.
+    basic_statistics: u8 = 255,
+    per_base_seq_quality: u8 = 255,
+    per_tile_seq_quality: u8 = 255,
+    per_seq_quality_scores: u8 = 255,
+    per_base_seq_content: u8 = 255,
+    per_seq_gc_content: u8 = 255,
+    per_base_n_content: u8 = 255,
+    seq_len_distribution: u8 = 255,
+    seq_duplication_levels: u8 = 255,
+    overrepresented_seqs: u8 = 255,
+    adapter_content: u8 = 255,
     // DADA2 stats (optional)
+    has_dada2: bool = false,
     dada2_input: u64 = NA_U64,
     dada2_filtered: u64 = NA_U64,
     dada2_denoised: u64 = NA_U64,
@@ -150,12 +225,102 @@ fn parseStatus(s: []const u8) u8 {
     return 255;
 }
 
-fn stripReadSuffix(name: []const u8) struct { base: []const u8, is_r1: bool } {
-    if (std.mem.endsWith(u8, name, "_R1")) return .{ .base = name[0 .. name.len - 3], .is_r1 = true };
-    if (std.mem.endsWith(u8, name, "_R2")) return .{ .base = name[0 .. name.len - 3], .is_r1 = false };
-    if (std.mem.endsWith(u8, name, "_1")) return .{ .base = name[0 .. name.len - 2], .is_r1 = true };
-    if (std.mem.endsWith(u8, name, "_2")) return .{ .base = name[0 .. name.len - 2], .is_r1 = false };
-    return .{ .base = name, .is_r1 = true };
+fn stripSuffix(name: []const u8, suffix: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    return name[0 .. name.len - suffix.len];
+}
+
+fn stripKnownFileSuffixes(name: []const u8) []const u8 {
+    var base = std.mem.trim(u8, name, " \t\r\n");
+    while (true) {
+        if (stripSuffix(base, "_fastqc.zip")) |v| {
+            base = v;
+            continue;
+        }
+        if (stripSuffix(base, "_fastqc")) |v| {
+            base = v;
+            continue;
+        }
+        if (stripSuffix(base, ".fastq.gz")) |v| {
+            base = v;
+            continue;
+        }
+        if (stripSuffix(base, ".fq.gz")) |v| {
+            base = v;
+            continue;
+        }
+        if (stripSuffix(base, ".fastq")) |v| {
+            base = v;
+            continue;
+        }
+        if (stripSuffix(base, ".fq")) |v| {
+            base = v;
+            continue;
+        }
+        if (stripSuffix(base, ".zip")) |v| {
+            base = v;
+            continue;
+        }
+        break;
+    }
+    return base;
+}
+
+fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+fn stripLaneSuffix(name: []const u8) []const u8 {
+    if (name.len < 5) return name;
+    const lane = name[name.len - 5 ..];
+    if (lane[0] == '_' and lane[1] == 'L' and isDigit(lane[2]) and isDigit(lane[3]) and isDigit(lane[4])) {
+        return name[0 .. name.len - 5];
+    }
+    return name;
+}
+
+fn normalizeSampleId(name: []const u8) NormalizedSampleId {
+    var base = stripKnownFileSuffixes(name);
+    var side: ReadSide = .unknown;
+    const patterns = [_]struct { suffix: []const u8, read_side: ReadSide }{
+        .{ .suffix = "_R1_001", .read_side = .r1 },
+        .{ .suffix = "_R2_001", .read_side = .r2 },
+        .{ .suffix = ".R1_001", .read_side = .r1 },
+        .{ .suffix = ".R2_001", .read_side = .r2 },
+        .{ .suffix = "_R1", .read_side = .r1 },
+        .{ .suffix = "_R2", .read_side = .r2 },
+        .{ .suffix = ".R1", .read_side = .r1 },
+        .{ .suffix = ".R2", .read_side = .r2 },
+        .{ .suffix = "_1", .read_side = .r1 },
+        .{ .suffix = "_2", .read_side = .r2 },
+    };
+    for (patterns) |p| {
+        if (stripSuffix(base, p.suffix)) |v| {
+            base = v;
+            side = p.read_side;
+            break;
+        }
+    }
+    base = stripLaneSuffix(base);
+    return .{ .base = base, .read_side = side };
+}
+
+test "normalize common MultiQC and FASTQ sample IDs" {
+    const r1 = normalizeSampleId("sample_R1_001.fastq.gz");
+    try std.testing.expectEqualStrings("sample", r1.base);
+    try std.testing.expectEqual(ReadSide.r1, r1.read_side);
+
+    const r2 = normalizeSampleId("sample_L001_R2_001_fastqc.zip");
+    try std.testing.expectEqualStrings("sample", r2.base);
+    try std.testing.expectEqual(ReadSide.r2, r2.read_side);
+
+    const underscore_pair = normalizeSampleId("sample_1.fq.gz");
+    try std.testing.expectEqualStrings("sample", underscore_pair.base);
+    try std.testing.expectEqual(ReadSide.r1, underscore_pair.read_side);
+
+    const single = normalizeSampleId("sample.fastq.gz");
+    try std.testing.expectEqualStrings("sample", single.base);
+    try std.testing.expectEqual(ReadSide.unknown, single.read_side);
 }
 
 fn divSafe(a: f64, b: f64) f64 {
@@ -192,8 +357,8 @@ fn parseTsv(
             error.StreamTooLong => continue,
         };
         const raw = maybe_line orelse break;
-        const line = std.mem.trim(u8, raw, "\r\n \t");
-        if (line.len == 0) continue;
+        const line = std.mem.trimRight(u8, raw, "\r\n");
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
 
         var fields: Row = .empty;
         var it = std.mem.splitScalar(u8, line, '\t');
@@ -227,6 +392,43 @@ fn getField(row: []const []u8, col_map: *const std.StringHashMap(usize), name: [
     return "";
 }
 
+fn requireColumn(col_map: *const std.StringHashMap(usize), path: []const u8, name: []const u8) !void {
+    if (col_map.contains(name)) return;
+    std.debug.print("ERROR: {s}: missing required column '{s}'\n", .{ path, name });
+    return error.MissingRequiredColumn;
+}
+
+fn requireDada2IdColumn(col_map: *const std.StringHashMap(usize), path: []const u8) ![]const u8 {
+    if (col_map.contains("sample-id")) return "sample-id";
+    if (col_map.contains("sample_id")) return "sample_id";
+    std.debug.print("ERROR: {s}: missing required DADA2 sample id column (expected 'sample-id' or 'sample_id')\n", .{path});
+    return error.MissingRequiredColumn;
+}
+
+fn mergeStatus(current: u8, next: u8) u8 {
+    if (next == 255) return current;
+    if (current == 255) return next;
+    return if (next > current) next else current;
+}
+
+fn findFileRowIndex(
+    file_map: *const std.StringHashMap(usize),
+    file_rows: []const MultiqcFileRow,
+    raw_id: []const u8,
+) ?usize {
+    if (file_map.get(raw_id)) |idx| return idx;
+
+    const norm = normalizeSampleId(raw_id);
+    var found: ?usize = null;
+    for (file_rows, 0..) |r, i| {
+        if (!std.mem.eql(u8, r.base_id, norm.base)) continue;
+        if (norm.read_side != .unknown and r.read_side != norm.read_side) continue;
+        if (found != null) return null;
+        found = i;
+    }
+    return found;
+}
+
 // ============================================================
 // Main parsing functions
 // ============================================================
@@ -235,8 +437,8 @@ fn parseGeneralStats(
     io: Io,
     alloc: Allocator,
     path: []const u8,
-    sample_map: *std.StringHashMap(usize),
-    samples: *AL(Sample),
+    file_map: *std.StringHashMap(usize),
+    file_rows: *AL(MultiqcFileRow),
 ) !void {
     var headers: AL([]u8) = .empty;
     defer {
@@ -254,26 +456,30 @@ fn parseGeneralStats(
     try parseTsv(io, alloc, path, &headers, &rows);
     var col = try buildColIndex(alloc, headers.items);
     defer col.deinit();
+    try requireColumn(&col, path, "Sample");
 
-    for (rows.items) |row| {
+    for (rows.items, 0..) |row, row_i| {
         if (row.items.len == 0) continue;
         const raw_id = getField(row.items, &col, "Sample");
-        if (raw_id.len == 0) continue;
-        const si = stripReadSuffix(raw_id);
-        var s = Sample{
+        if (raw_id.len == 0) {
+            std.debug.print("ERROR: {s}: missing Sample value on data row {d}\n", .{ path, row_i + 2 });
+            return error.MissingRequiredValue;
+        }
+        const norm = normalizeSampleId(raw_id);
+        var r = MultiqcFileRow{
             .id = try alloc.dupe(u8, raw_id),
-            .base_id = try alloc.dupe(u8, si.base),
-            .is_r1 = si.is_r1,
+            .base_id = try alloc.dupe(u8, norm.base),
+            .read_side = norm.read_side,
         };
-        s.pct_duplicates = parseF64(getField(row.items, &col, "percent_duplicates"));
-        s.pct_gc = parseF64(getField(row.items, &col, "percent_gc"));
-        s.avg_seq_len = parseF64(getField(row.items, &col, "avg_sequence_length"));
-        s.median_seq_len = parseF64(getField(row.items, &col, "median_sequence_length"));
-        s.pct_fails = parseF64(getField(row.items, &col, "percent_fails"));
-        s.total_sequences = parseF64(getField(row.items, &col, "total_sequences"));
-        const idx = samples.items.len;
-        try samples.append(alloc, s);
-        try sample_map.put(samples.items[idx].id, idx);
+        r.pct_duplicates = parseF64(getField(row.items, &col, "percent_duplicates"));
+        r.pct_gc = parseF64(getField(row.items, &col, "percent_gc"));
+        r.avg_seq_len = parseF64(getField(row.items, &col, "avg_sequence_length"));
+        r.median_seq_len = parseF64(getField(row.items, &col, "median_sequence_length"));
+        r.pct_fails = parseF64(getField(row.items, &col, "percent_fails"));
+        r.total_sequences = parseF64(getField(row.items, &col, "total_sequences"));
+        const idx = file_rows.items.len;
+        try file_rows.append(alloc, r);
+        try file_map.put(file_rows.items[idx].id, idx);
     }
 }
 
@@ -281,8 +487,8 @@ fn parseFastqcStats(
     io: Io,
     alloc: Allocator,
     path: []const u8,
-    sample_map: *std.StringHashMap(usize),
-    samples: *AL(Sample),
+    file_map: *std.StringHashMap(usize),
+    file_rows: *AL(MultiqcFileRow),
 ) !void {
     var headers: AL([]u8) = .empty;
     defer {
@@ -300,34 +506,157 @@ fn parseFastqcStats(
     try parseTsv(io, alloc, path, &headers, &rows);
     var col = try buildColIndex(alloc, headers.items);
     defer col.deinit();
+    try requireColumn(&col, path, "Sample");
 
-    for (rows.items) |row| {
+    for (rows.items, 0..) |row, row_i| {
         if (row.items.len == 0) continue;
         const raw_id = getField(row.items, &col, "Sample");
-        if (raw_id.len == 0) continue;
-        const idx = sample_map.get(raw_id) orelse continue;
-        var s = &samples.items[idx];
-        s.basic_statistics = parseStatus(getField(row.items, &col, "basic_statistics"));
-        s.per_base_seq_quality = parseStatus(getField(row.items, &col, "per_base_sequence_quality"));
-        s.per_tile_seq_quality = parseStatus(getField(row.items, &col, "per_tile_sequence_quality"));
-        s.per_seq_quality_scores = parseStatus(getField(row.items, &col, "per_sequence_quality_scores"));
-        s.per_base_seq_content = parseStatus(getField(row.items, &col, "per_base_sequence_content"));
-        s.per_seq_gc_content = parseStatus(getField(row.items, &col, "per_sequence_gc_content"));
-        s.per_base_n_content = parseStatus(getField(row.items, &col, "per_base_n_content"));
-        s.seq_len_distribution = parseStatus(getField(row.items, &col, "sequence_length_distribution"));
-        s.seq_duplication_levels = parseStatus(getField(row.items, &col, "sequence_duplication_levels"));
-        s.overrepresented_seqs = parseStatus(getField(row.items, &col, "overrepresented_sequences"));
-        s.adapter_content = parseStatus(getField(row.items, &col, "adapter_content"));
+        if (raw_id.len == 0) {
+            std.debug.print("ERROR: {s}: missing Sample value on data row {d}\n", .{ path, row_i + 2 });
+            return error.MissingRequiredValue;
+        }
+        const idx = findFileRowIndex(file_map, file_rows.items, raw_id) orelse continue;
+        var r = &file_rows.items[idx];
+        r.basic_statistics = mergeStatus(r.basic_statistics, parseStatus(getField(row.items, &col, "basic_statistics")));
+        r.per_base_seq_quality = mergeStatus(r.per_base_seq_quality, parseStatus(getField(row.items, &col, "per_base_sequence_quality")));
+        r.per_tile_seq_quality = mergeStatus(r.per_tile_seq_quality, parseStatus(getField(row.items, &col, "per_tile_sequence_quality")));
+        r.per_seq_quality_scores = mergeStatus(r.per_seq_quality_scores, parseStatus(getField(row.items, &col, "per_sequence_quality_scores")));
+        r.per_base_seq_content = mergeStatus(r.per_base_seq_content, parseStatus(getField(row.items, &col, "per_base_sequence_content")));
+        r.per_seq_gc_content = mergeStatus(r.per_seq_gc_content, parseStatus(getField(row.items, &col, "per_sequence_gc_content")));
+        r.per_base_n_content = mergeStatus(r.per_base_n_content, parseStatus(getField(row.items, &col, "per_base_n_content")));
+        r.seq_len_distribution = mergeStatus(r.seq_len_distribution, parseStatus(getField(row.items, &col, "sequence_length_distribution")));
+        r.seq_duplication_levels = mergeStatus(r.seq_duplication_levels, parseStatus(getField(row.items, &col, "sequence_duplication_levels")));
+        r.overrepresented_seqs = mergeStatus(r.overrepresented_seqs, parseStatus(getField(row.items, &col, "overrepresented_sequences")));
+        r.adapter_content = mergeStatus(r.adapter_content, parseStatus(getField(row.items, &col, "adapter_content")));
     }
+}
+
+fn applyMultiqcRowToSample(row: MultiqcFileRow, s: *SampleRecord) void {
+    s.file_count += 1;
+    switch (row.read_side) {
+        .r1 => s.seen_r1 = true,
+        .r2 => s.seen_r2 = true,
+        .unknown => s.seen_unknown_read = true,
+    }
+
+    if (row.total_sequences != NA_F64) {
+        if (s.total_sequences == NA_F64) s.total_sequences = 0.0;
+        s.total_sequences += row.total_sequences;
+    }
+    const weight = row.total_sequences;
+    s.pct_duplicates_agg.add(row.pct_duplicates, weight);
+    s.pct_gc_agg.add(row.pct_gc, weight);
+    s.avg_seq_len_agg.add(row.avg_seq_len, weight);
+    s.median_seq_len_agg.add(row.median_seq_len, weight);
+    s.pct_fails_agg.add(row.pct_fails, weight);
+
+    s.basic_statistics = mergeStatus(s.basic_statistics, row.basic_statistics);
+    s.per_base_seq_quality = mergeStatus(s.per_base_seq_quality, row.per_base_seq_quality);
+    s.per_tile_seq_quality = mergeStatus(s.per_tile_seq_quality, row.per_tile_seq_quality);
+    s.per_seq_quality_scores = mergeStatus(s.per_seq_quality_scores, row.per_seq_quality_scores);
+    s.per_base_seq_content = mergeStatus(s.per_base_seq_content, row.per_base_seq_content);
+    s.per_seq_gc_content = mergeStatus(s.per_seq_gc_content, row.per_seq_gc_content);
+    s.per_base_n_content = mergeStatus(s.per_base_n_content, row.per_base_n_content);
+    s.seq_len_distribution = mergeStatus(s.seq_len_distribution, row.seq_len_distribution);
+    s.seq_duplication_levels = mergeStatus(s.seq_duplication_levels, row.seq_duplication_levels);
+    s.overrepresented_seqs = mergeStatus(s.overrepresented_seqs, row.overrepresented_seqs);
+    s.adapter_content = mergeStatus(s.adapter_content, row.adapter_content);
+}
+
+fn finalizeSampleAggregation(s: *SampleRecord) void {
+    s.pct_duplicates = s.pct_duplicates_agg.value();
+    s.pct_gc = s.pct_gc_agg.value();
+    s.avg_seq_len = s.avg_seq_len_agg.value();
+    s.median_seq_len = s.median_seq_len_agg.value();
+    s.pct_fails = s.pct_fails_agg.value();
+}
+
+fn validateSampleRecordUniqueness(samples: []const SampleRecord, sample_map: *const std.StringHashMap(usize)) void {
+    for (samples, 0..) |s, i| {
+        std.debug.assert(sample_map.get(s.id).? == i);
+    }
+}
+
+fn aggregateMultiqcRows(
+    alloc: Allocator,
+    file_rows: []const MultiqcFileRow,
+    samples: *AL(SampleRecord),
+    sample_map: *std.StringHashMap(usize),
+) !void {
+    // Aggregation rules:
+    // - total_sequences is a count and is summed across all rows for the biological sample.
+    // - percent/average fields use read-count weighted averages when total_sequences is available.
+    //   If no usable read count exists for a metric, fall back to an arithmetic mean of available values.
+    // - FastQC statuses use the worst observed status across rows: fail > warn > pass > missing.
+    for (file_rows) |row| {
+        var idx: usize = undefined;
+        if (sample_map.get(row.base_id)) |existing| {
+            idx = existing;
+        } else {
+            idx = samples.items.len;
+            try samples.append(alloc, SampleRecord{ .id = try alloc.dupe(u8, row.base_id) });
+            try sample_map.put(samples.items[idx].id, idx);
+        }
+        applyMultiqcRowToSample(row, &samples.items[idx]);
+    }
+    for (samples.items) |*s| finalizeSampleAggregation(s);
+    validateSampleRecordUniqueness(samples.items, sample_map);
+}
+
+test "aggregate paired MultiQC rows into one biological sample" {
+    const alloc = std.testing.allocator;
+    var rows: AL(MultiqcFileRow) = .empty;
+    defer rows.deinit(alloc);
+
+    try rows.append(alloc, MultiqcFileRow{
+        .id = "sample_R1",
+        .base_id = "sample",
+        .read_side = .r1,
+        .pct_duplicates = 10.0,
+        .pct_gc = 50.0,
+        .total_sequences = 100.0,
+        .per_base_seq_quality = 0,
+    });
+    try rows.append(alloc, MultiqcFileRow{
+        .id = "sample_R2",
+        .base_id = "sample",
+        .read_side = .r2,
+        .pct_duplicates = 30.0,
+        .pct_gc = 60.0,
+        .total_sequences = 300.0,
+        .per_base_seq_quality = 2,
+    });
+
+    var samples: AL(SampleRecord) = .empty;
+    defer {
+        for (samples.items) |s| alloc.free(s.id);
+        samples.deinit(alloc);
+    }
+    var sample_map = std.StringHashMap(usize).init(alloc);
+    defer sample_map.deinit();
+
+    try aggregateMultiqcRows(alloc, rows.items, &samples, &sample_map);
+    try std.testing.expectEqual(@as(usize, 1), samples.items.len);
+
+    const s = samples.items[0];
+    try std.testing.expectEqualStrings("sample", s.id);
+    try std.testing.expectEqual(@as(usize, 2), s.file_count);
+    try std.testing.expect(s.seen_r1);
+    try std.testing.expect(s.seen_r2);
+    try std.testing.expectApproxEqAbs(@as(f64, 400.0), s.total_sequences, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 25.0), s.pct_duplicates, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 57.5), s.pct_gc, 0.0001);
+    try std.testing.expectEqual(@as(u8, 2), s.per_base_seq_quality);
 }
 
 fn parseDada2Stats(
     io: Io,
     alloc: Allocator,
     path: []const u8,
-    sample_map: *std.StringHashMap(usize),
-    samples: *AL(Sample),
-    unmatched: *AL([]u8),
+    sample_map: *const std.StringHashMap(usize),
+    samples: []SampleRecord,
+    unmatched_dada2: *AL([]u8),
+    duplicate_dada2: *AL([]u8),
 ) !void {
     var headers: AL([]u8) = .empty;
     defer {
@@ -346,30 +675,34 @@ fn parseDada2Stats(
     var col = try buildColIndex(alloc, headers.items);
     defer col.deinit();
 
-    const id_col: []const u8 = if (col.contains("sample-id")) "sample-id" else "sample_id";
+    const id_col = try requireDada2IdColumn(&col, path);
+    const required_counts = [_][]const u8{ "input", "filtered", "denoised", "merged", "non-chimeric" };
+    for (required_counts) |name| try requireColumn(&col, path, name);
 
-    for (rows.items) |row| {
+    for (rows.items, 0..) |row, row_i| {
         if (row.items.len == 0) continue;
         const raw_id = getField(row.items, &col, id_col);
-        if (raw_id.len == 0) continue;
-
-        var matched = false;
-        if (sample_map.get(raw_id)) |idx| {
-            applyDada2(row.items, &col, &samples.items[idx]);
-            matched = true;
-        } else {
-            for (samples.items) |*s| {
-                if (std.mem.eql(u8, s.base_id, raw_id)) {
-                    applyDada2(row.items, &col, s);
-                    matched = true;
-                }
-            }
+        if (raw_id.len == 0) {
+            std.debug.print("ERROR: {s}: missing DADA2 sample id on data row {d}\n", .{ path, row_i + 2 });
+            return error.MissingRequiredValue;
         }
-        if (!matched) try unmatched.append(alloc, try alloc.dupe(u8, raw_id));
+        const norm = normalizeSampleId(raw_id);
+
+        if (sample_map.get(norm.base)) |idx| {
+            const s = &samples[idx];
+            if (s.has_dada2) {
+                try duplicate_dada2.append(alloc, try alloc.dupe(u8, raw_id));
+                continue;
+            }
+            applyDada2(row.items, &col, s);
+        } else {
+            try unmatched_dada2.append(alloc, try alloc.dupe(u8, raw_id));
+        }
     }
 }
 
-fn applyDada2(row: []const []u8, col: *const std.StringHashMap(usize), s: *Sample) void {
+fn applyDada2(row: []const []u8, col: *const std.StringHashMap(usize), s: *SampleRecord) void {
+    s.has_dada2 = true;
     s.dada2_input = parseU64fromField(getField(row, col, "input"));
     s.dada2_filtered = parseU64fromField(getField(row, col, "filtered"));
     s.dada2_denoised = parseU64fromField(getField(row, col, "denoised"));
@@ -377,11 +710,17 @@ fn applyDada2(row: []const []u8, col: *const std.StringHashMap(usize), s: *Sampl
     s.dada2_non_chimeric = parseU64fromField(getField(row, col, "non-chimeric"));
 }
 
+fn collectMultiqcWithoutDada2(alloc: Allocator, samples: []const SampleRecord, out: *AL([]u8)) !void {
+    for (samples) |s| {
+        if (!s.has_dada2) try out.append(alloc, try alloc.dupe(u8, s.id));
+    }
+}
+
 // ============================================================
 // Metrics, classification, flags
 // ============================================================
 
-fn computeDerivedMetrics(samples: []Sample) void {
+fn computeDerivedMetrics(samples: []SampleRecord) void {
     for (samples) |*s| {
         if (s.dada2_input == NA_U64) continue;
         const inp: f64 = @floatFromInt(s.dada2_input);
@@ -399,7 +738,7 @@ fn computeDerivedMetrics(samples: []Sample) void {
     }
 }
 
-fn classifySamples(samples: []Sample, cfg: Config) void {
+fn classifySamples(samples: []SampleRecord, cfg: Config) void {
     for (samples) |*s| {
         if (s.dada2_non_chimeric == NA_U64) {
             s.classification = .multiqc_only;
@@ -410,7 +749,7 @@ fn classifySamples(samples: []Sample, cfg: Config) void {
     }
 }
 
-fn computeGcStats(samples: []const Sample) struct { mean: f64, sd: f64 } {
+fn computeGcStats(samples: []const SampleRecord) struct { mean: f64, sd: f64 } {
     var sum: f64 = 0.0;
     var count: f64 = 0.0;
     for (samples) |s| {
@@ -431,7 +770,7 @@ fn computeGcStats(samples: []const Sample) struct { mean: f64, sd: f64 } {
     return .{ .mean = mean, .sd = @sqrt(sq_sum / count) };
 }
 
-fn assignFlags(samples: []Sample, cfg: Config) void {
+fn assignFlags(samples: []SampleRecord, cfg: Config) void {
     const gc = computeGcStats(samples);
     const gc_thresh: f64 = if (gc.sd != NA_F64) cfg.gc_outlier_sd * gc.sd else NA_F64;
     for (samples) |*s| {
@@ -448,7 +787,7 @@ fn assignFlags(samples: []Sample, cfg: Config) void {
     }
 }
 
-fn assignRecommendations(samples: []Sample) void {
+fn assignRecommendations(samples: []SampleRecord) void {
     for (samples) |*s| {
         const severe = (s.classification == .fail_depth) or
             s.flag_very_low_filtered or
@@ -471,19 +810,22 @@ fn assignRecommendations(samples: []Sample) void {
 // Sorting
 // ============================================================
 
-fn cmpNcDesc(_: void, a: Sample, b: Sample) bool {
+fn cmpNcDesc(_: void, a: SampleRecord, b: SampleRecord) bool {
     const av = if (a.dada2_non_chimeric == NA_U64) 0 else a.dada2_non_chimeric;
     const bv = if (b.dada2_non_chimeric == NA_U64) 0 else b.dada2_non_chimeric;
+    if (av == bv) return std.mem.lessThan(u8, a.id, b.id);
     return av > bv;
 }
-fn cmpNcAsc(_: void, a: Sample, b: Sample) bool {
+fn cmpNcAsc(_: void, a: SampleRecord, b: SampleRecord) bool {
     const av = if (a.dada2_non_chimeric == NA_U64) 0 else a.dada2_non_chimeric;
     const bv = if (b.dada2_non_chimeric == NA_U64) 0 else b.dada2_non_chimeric;
+    if (av == bv) return std.mem.lessThan(u8, a.id, b.id);
     return av < bv;
 }
-fn cmpTotalDesc(_: void, a: Sample, b: Sample) bool {
+fn cmpTotalDesc(_: void, a: SampleRecord, b: SampleRecord) bool {
     const av: f64 = if (a.total_sequences == NA_F64) 0.0 else a.total_sequences;
     const bv: f64 = if (b.total_sequences == NA_F64) 0.0 else b.total_sequences;
+    if (av == bv) return std.mem.lessThan(u8, a.id, b.id);
     return av > bv;
 }
 
@@ -528,6 +870,29 @@ fn pct(count: usize, total: usize) f64 {
     return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(total)) * 100.0;
 }
 
+fn totalSourceFileCount(samples: []const SampleRecord) usize {
+    var total: usize = 0;
+    for (samples) |s| total += s.file_count;
+    return total;
+}
+
+fn readSidesLabel(s: SampleRecord) []const u8 {
+    if (s.seen_r1 and s.seen_r2 and s.seen_unknown_read) return "R1,R2,unknown";
+    if (s.seen_r1 and s.seen_r2) return "R1,R2";
+    if (s.seen_r1 and s.seen_unknown_read) return "R1,unknown";
+    if (s.seen_r2 and s.seen_unknown_read) return "R2,unknown";
+    if (s.seen_r1) return "R1";
+    if (s.seen_r2) return "R2";
+    if (s.seen_unknown_read) return "unknown";
+    return "none";
+}
+
+const JoinDiagnostics = struct {
+    multiqc_without_dada2: []const []u8,
+    unmatched_dada2: []const []u8,
+    duplicate_dada2: []const []u8,
+};
+
 // ============================================================
 // Count summary
 // ============================================================
@@ -552,7 +917,7 @@ const Counts = struct {
     n_excl: usize = 0,
 };
 
-fn countSamples(samples: []const Sample) Counts {
+fn countSamples(samples: []const SampleRecord) Counts {
     var c = Counts{};
     for (samples) |s| {
         switch (s.classification) {
@@ -595,18 +960,20 @@ fn logInfo(io: Io, comptime fmt: []const u8, args: anytype) void {
 // Output: stdout summary
 // ============================================================
 
-fn writeStdout(io: Io, samples: []const Sample, cfg: Config, has_dada2: bool, unmatched: []const []u8) !void {
+fn writeStdout(io: Io, samples: []const SampleRecord, cfg: Config, has_dada2: bool, diag: JoinDiagnostics) !void {
     var buf: [8192]u8 = undefined;
     var fw = Io.File.stdout().writer(io, &buf);
     const w = &fw.interface;
 
     const n = samples.len;
+    const n_files = totalSourceFileCount(samples);
     const c = countSamples(samples);
 
     try w.print("\n==========================================================\n", .{});
     try w.print("         MICROBIOME QC SUMMARY REPORT\n", .{});
     try w.print("==========================================================\n\n", .{});
-    try w.print("Total samples (files): {d}\n", .{n});
+    try w.print("Total biological samples: {d}\n", .{n});
+    try w.print("MultiQC file rows aggregated: {d}\n", .{n_files});
 
     if (!has_dada2) {
         try w.print("\nWARNING: MultiQC-only mode. DADA2 stats not provided.\n", .{});
@@ -619,8 +986,9 @@ fn writeStdout(io: Io, samples: []const Sample, cfg: Config, has_dada2: bool, un
         try w.print("  PASS_ACCEPTABLE (>={d}): {d}  ({d:.1}%)\n", .{ cfg.pass_acceptable, c.n_acceptable, pct(c.n_acceptable, n) });
         try w.print("  LOW_DEPTH       (>={d}): {d}  ({d:.1}%)\n", .{ cfg.low_depth, c.n_low, pct(c.n_low, n) });
         try w.print("  FAIL_DEPTH      (<{d}):  {d}  ({d:.1}%)\n", .{ cfg.low_depth, c.n_fail, pct(c.n_fail, n) });
+        try w.print("  MULTIQC_ONLY    (no DADA2): {d}  ({d:.1}%)\n", .{ c.n_mqc_only, pct(c.n_mqc_only, n) });
     } else {
-        try w.print("  MULTIQC_ONLY: {d} files\n", .{c.n_mqc_only});
+        try w.print("  MULTIQC_ONLY: {d} biological samples\n", .{c.n_mqc_only});
     }
 
     try w.print("\n-- PROCESS FLAGS (DADA2) --\n", .{});
@@ -645,10 +1013,20 @@ fn writeStdout(io: Io, samples: []const Sample, cfg: Config, has_dada2: bool, un
     try w.print("  review manually: {d}  ({d:.1}%)\n", .{ c.n_rev, pct(c.n_rev, n) });
     try w.print("  exclude:         {d}  ({d:.1}%)\n", .{ c.n_excl, pct(c.n_excl, n) });
 
-    if (unmatched.len > 0) {
-        try w.print("\n-- DADA2 IDs UNMATCHED IN MultiQC ({d}) --\n", .{unmatched.len});
-        for (unmatched[0..@min(10, unmatched.len)]) |u| try w.print("  {s}\n", .{u});
-        if (unmatched.len > 10) try w.print("  ... and {d} more\n", .{unmatched.len - 10});
+    if (has_dada2 and diag.multiqc_without_dada2.len > 0) {
+        try w.print("\n-- MultiQC SAMPLES WITHOUT DADA2 ({d}) --\n", .{diag.multiqc_without_dada2.len});
+        for (diag.multiqc_without_dada2[0..@min(10, diag.multiqc_without_dada2.len)]) |u| try w.print("  {s}\n", .{u});
+        if (diag.multiqc_without_dada2.len > 10) try w.print("  ... and {d} more\n", .{diag.multiqc_without_dada2.len - 10});
+    }
+    if (diag.unmatched_dada2.len > 0) {
+        try w.print("\n-- DADA2 IDs UNMATCHED IN MultiQC ({d}) --\n", .{diag.unmatched_dada2.len});
+        for (diag.unmatched_dada2[0..@min(10, diag.unmatched_dada2.len)]) |u| try w.print("  {s}\n", .{u});
+        if (diag.unmatched_dada2.len > 10) try w.print("  ... and {d} more\n", .{diag.unmatched_dada2.len - 10});
+    }
+    if (diag.duplicate_dada2.len > 0) {
+        try w.print("\n-- DUPLICATE DADA2 IDS SKIPPED ({d}) --\n", .{diag.duplicate_dada2.len});
+        for (diag.duplicate_dada2[0..@min(10, diag.duplicate_dada2.len)]) |u| try w.print("  {s}\n", .{u});
+        if (diag.duplicate_dada2.len > 10) try w.print("  ... and {d} more\n", .{diag.duplicate_dada2.len - 10});
     }
     try w.print("\n", .{});
     try w.flush();
@@ -661,10 +1039,10 @@ fn writeStdout(io: Io, samples: []const Sample, cfg: Config, has_dada2: bool, un
 fn writeMarkdown(
     io: Io,
     alloc: Allocator,
-    samples: []Sample,
+    samples: []const SampleRecord,
     cfg: Config,
     has_dada2: bool,
-    unmatched: []const []u8,
+    diag: JoinDiagnostics,
     gs_path: []const u8,
     fq_path: []const u8,
     d2_path: []const u8,
@@ -679,6 +1057,7 @@ fn writeMarkdown(
     const w = &fw.interface;
 
     const n = samples.len;
+    const n_files = totalSourceFileCount(samples);
     const c = countSamples(samples);
 
     try w.print("# Microbiome QC Summary Report\n\n", .{});
@@ -692,7 +1071,8 @@ fn writeMarkdown(
         try w.print("> **MultiQC-only mode**: Provide `--dada2-stats` after DADA2 for complete evaluation.\n\n", .{});
     }
 
-    try w.print("## Dataset Overview\n\n**Total samples (files):** {d}\n\n", .{n});
+    try w.print("## Dataset Overview\n\n**Total biological samples:** {d}  \n", .{n});
+    try w.print("**MultiQC file rows aggregated:** {d}\n\n", .{n_files});
 
     if (has_dada2) {
         try w.print("### Depth Classification (non-chimeric reads)\n\n", .{});
@@ -700,7 +1080,8 @@ fn writeMarkdown(
         try w.print("| PASS_STRONG | >={d} | {d} | {d:.1}% |\n", .{ cfg.pass_strong, c.n_strong, pct(c.n_strong, n) });
         try w.print("| PASS_ACCEPTABLE | >={d} | {d} | {d:.1}% |\n", .{ cfg.pass_acceptable, c.n_acceptable, pct(c.n_acceptable, n) });
         try w.print("| LOW_DEPTH | >={d} | {d} | {d:.1}% |\n", .{ cfg.low_depth, c.n_low, pct(c.n_low, n) });
-        try w.print("| FAIL_DEPTH | <{d} | {d} | {d:.1}% |\n\n", .{ cfg.low_depth, c.n_fail, pct(c.n_fail, n) });
+        try w.print("| FAIL_DEPTH | <{d} | {d} | {d:.1}% |\n", .{ cfg.low_depth, c.n_fail, pct(c.n_fail, n) });
+        try w.print("| MULTIQC_ONLY | no DADA2 match | {d} | {d:.1}% |\n\n", .{ c.n_mqc_only, pct(c.n_mqc_only, n) });
 
         try w.print("## Process Flags (DADA2)\n\n", .{});
         try w.print("| Flag | Threshold | N Flagged |\n|---|---|---:|\n", .{});
@@ -812,11 +1193,11 @@ fn writeMarkdown(
 
     // Top/bottom tables
     const n_top = @min(10, n);
-    var sorted_copy = try alloc.dupe(Sample, samples);
+    var sorted_copy = try alloc.dupe(SampleRecord, samples);
     defer alloc.free(sorted_copy);
 
     if (has_dada2) {
-        std.mem.sort(Sample, sorted_copy, {}, cmpNcDesc);
+        std.mem.sort(SampleRecord, sorted_copy, {}, cmpNcDesc);
         try w.print("## Top {d} Samples (Non-Chimeric Reads)\n\n| Rank | Sample | NonChimeric | Retention | Class |\n|---:|---|---:|---:|---|\n", .{n_top});
         for (sorted_copy[0..n_top], 1..) |s, rank| {
             var b1: [32]u8 = undefined;
@@ -824,7 +1205,7 @@ fn writeMarkdown(
             try w.print("| {d} | {s} | {s} | {s} | {s} |\n", .{ rank, s.id, u2s(&b1, s.dada2_non_chimeric), f2s(&b2, s.retention_rate, 4), s.classification.label() });
         }
         try w.print("\n", .{});
-        std.mem.sort(Sample, sorted_copy, {}, cmpNcAsc);
+        std.mem.sort(SampleRecord, sorted_copy, {}, cmpNcAsc);
         try w.print("## Bottom {d} Samples (Non-Chimeric Reads)\n\n| Rank | Sample | NonChimeric | Retention | Class |\n|---:|---|---:|---:|---|\n", .{n_top});
         for (sorted_copy[0..n_top], 1..) |s, rank| {
             var b1: [32]u8 = undefined;
@@ -833,7 +1214,7 @@ fn writeMarkdown(
         }
         try w.print("\n", .{});
     } else {
-        std.mem.sort(Sample, sorted_copy, {}, cmpTotalDesc);
+        std.mem.sort(SampleRecord, sorted_copy, {}, cmpTotalDesc);
         try w.print("## Top {d} by Total Sequences\n\n| Rank | Sample | TotalSeqs | %GC | %Dup |\n|---:|---|---:|---:|---:|\n", .{n_top});
         for (sorted_copy[0..n_top], 1..) |s, rank| {
             var b1: [32]u8 = undefined;
@@ -861,9 +1242,21 @@ fn writeMarkdown(
         try w.print("**PROCEED**: Dataset suitable for downstream analysis. Apply standard rarefaction/normalization.\n\n", .{});
     }
 
-    if (unmatched.len > 0) {
-        try w.print("## DADA2 Samples Not Matched in MultiQC ({d})\n\n", .{unmatched.len});
-        for (unmatched) |u| try w.print("- `{s}`\n", .{u});
+    if (has_dada2 and diag.multiqc_without_dada2.len > 0) {
+        try w.print("## MultiQC Samples Without DADA2 ({d})\n\n", .{diag.multiqc_without_dada2.len});
+        for (diag.multiqc_without_dada2) |u| try w.print("- `{s}`\n", .{u});
+        try w.print("\n", .{});
+    }
+
+    if (diag.unmatched_dada2.len > 0) {
+        try w.print("## DADA2 Samples Not Matched in MultiQC ({d})\n\n", .{diag.unmatched_dada2.len});
+        for (diag.unmatched_dada2) |u| try w.print("- `{s}`\n", .{u});
+        try w.print("\n", .{});
+    }
+
+    if (diag.duplicate_dada2.len > 0) {
+        try w.print("## Duplicate DADA2 Sample IDs Skipped ({d})\n\n", .{diag.duplicate_dada2.len});
+        for (diag.duplicate_dada2) |u| try w.print("- `{s}`\n", .{u});
         try w.print("\n", .{});
     }
 
@@ -885,7 +1278,7 @@ fn writeMarkdown(
 // Output: samples TSV
 // ============================================================
 
-fn writeSamplesTsv(io: Io, alloc: Allocator, samples: []const Sample, has_dada2: bool, prefix: []const u8) !void {
+fn writeSamplesTsv(io: Io, alloc: Allocator, samples: []const SampleRecord, has_dada2: bool, prefix: []const u8) !void {
     const fname = try std.fmt.allocPrint(alloc, "{s}.samples.tsv", .{prefix});
     defer alloc.free(fname);
     const file = try Io.Dir.createFileAbsolute(io, fname, .{});
@@ -895,7 +1288,7 @@ fn writeSamplesTsv(io: Io, alloc: Allocator, samples: []const Sample, has_dada2:
     const w = &fw.interface;
 
     // Header
-    try w.print("sample_id\tbase_id\tis_r1\tpct_duplicates\tpct_gc\tavg_seq_len\tmedian_seq_len\tpct_fails\ttotal_sequences\t", .{});
+    try w.print("sample_id\tbase_id\tsource_file_count\tread_sides\tpct_duplicates\tpct_gc\tavg_seq_len\tmedian_seq_len\tpct_fails\ttotal_sequences\t", .{});
     try w.print("basic_statistics\tper_base_seq_quality\tper_tile_seq_quality\tper_seq_quality_scores\t", .{});
     try w.print("per_base_seq_content\tper_seq_gc_content\tper_base_n_content\tseq_len_distribution\t", .{});
     try w.print("seq_duplication_levels\toverrepresented_seqs\tadapter_content\t", .{});
@@ -916,10 +1309,11 @@ fn writeSamplesTsv(io: Io, alloc: Allocator, samples: []const Sample, has_dada2:
         var b4: [32]u8 = undefined;
         var b5: [32]u8 = undefined;
         var b6: [32]u8 = undefined;
-        try w.print("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t", .{
-            s.id,                          s.base_id,                if (s.is_r1) "R1" else "R2",
-            f2s(&b1, s.pct_duplicates, 4), f2s(&b2, s.pct_gc, 1),    f2s(&b3, s.avg_seq_len, 1),
-            f2s(&b4, s.median_seq_len, 1), f2s(&b5, s.pct_fails, 4), f2s(&b6, s.total_sequences, 0),
+        try w.print("{s}\t{s}\t{d}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t", .{
+            s.id,                           s.id,                          s.file_count,
+            readSidesLabel(s),              f2s(&b1, s.pct_duplicates, 4), f2s(&b2, s.pct_gc, 1),
+            f2s(&b3, s.avg_seq_len, 1),     f2s(&b4, s.median_seq_len, 1), f2s(&b5, s.pct_fails, 4),
+            f2s(&b6, s.total_sequences, 0),
         });
         try w.print("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t", .{
             statusStr(s.basic_statistics),       statusStr(s.per_base_seq_quality),
@@ -968,7 +1362,7 @@ fn writeSamplesTsv(io: Io, alloc: Allocator, samples: []const Sample, has_dada2:
 // Output: flags TSV (melted)
 // ============================================================
 
-fn writeFlagsTsv(io: Io, alloc: Allocator, samples: []const Sample, has_dada2: bool, prefix: []const u8) !void {
+fn writeFlagsTsv(io: Io, alloc: Allocator, samples: []const SampleRecord, has_dada2: bool, prefix: []const u8) !void {
     const fname = try std.fmt.allocPrint(alloc, "{s}.flags.tsv", .{prefix});
     defer alloc.free(fname);
     const file = try Io.Dir.createFileAbsolute(io, fname, .{});
@@ -1177,35 +1571,63 @@ pub fn main(init: std.process.Init) !void {
 
     const has_dada2 = d2_path.len > 0;
 
-    var samples: AL(Sample) = .empty;
+    var file_rows: AL(MultiqcFileRow) = .empty;
     defer {
-        for (samples.items) |s| {
-            alloc.free(s.id);
-            alloc.free(s.base_id);
+        for (file_rows.items) |r| {
+            alloc.free(r.id);
+            alloc.free(r.base_id);
         }
+        file_rows.deinit(alloc);
+    }
+    var file_map = std.StringHashMap(usize).init(alloc);
+    defer file_map.deinit();
+
+    logInfo(io, "Parsing: {s}\n", .{gs_path});
+    try parseGeneralStats(io, alloc, gs_path, &file_map, &file_rows);
+    logInfo(io, "  -> {d} MultiQC file rows loaded\n", .{file_rows.items.len});
+
+    logInfo(io, "Parsing: {s}\n", .{fq_path});
+    try parseFastqcStats(io, alloc, fq_path, &file_map, &file_rows);
+
+    var samples: AL(SampleRecord) = .empty;
+    defer {
+        for (samples.items) |s| alloc.free(s.id);
         samples.deinit(alloc);
     }
     var sample_map = std.StringHashMap(usize).init(alloc);
     defer sample_map.deinit();
 
-    logInfo(io, "Parsing: {s}\n", .{gs_path});
-    try parseGeneralStats(io, alloc, gs_path, &sample_map, &samples);
-    logInfo(io, "  -> {d} samples loaded\n", .{samples.items.len});
+    try aggregateMultiqcRows(alloc, file_rows.items, &samples, &sample_map);
+    logInfo(io, "  -> {d} biological samples after aggregation\n", .{samples.items.len});
 
-    logInfo(io, "Parsing: {s}\n", .{fq_path});
-    try parseFastqcStats(io, alloc, fq_path, &sample_map, &samples);
-
-    var unmatched: AL([]u8) = .empty;
+    var multiqc_without_dada2: AL([]u8) = .empty;
     defer {
-        for (unmatched.items) |u| alloc.free(u);
-        unmatched.deinit(alloc);
+        for (multiqc_without_dada2.items) |u| alloc.free(u);
+        multiqc_without_dada2.deinit(alloc);
+    }
+    var unmatched_dada2: AL([]u8) = .empty;
+    defer {
+        for (unmatched_dada2.items) |u| alloc.free(u);
+        unmatched_dada2.deinit(alloc);
+    }
+    var duplicate_dada2: AL([]u8) = .empty;
+    defer {
+        for (duplicate_dada2.items) |u| alloc.free(u);
+        duplicate_dada2.deinit(alloc);
     }
 
     if (has_dada2) {
         logInfo(io, "Parsing: {s}\n", .{d2_path});
-        try parseDada2Stats(io, alloc, d2_path, &sample_map, &samples, &unmatched);
-        if (unmatched.items.len > 0) {
-            logInfo(io, "  WARNING: {d} DADA2 IDs not matched in MultiQC\n", .{unmatched.items.len});
+        try parseDada2Stats(io, alloc, d2_path, &sample_map, samples.items, &unmatched_dada2, &duplicate_dada2);
+        try collectMultiqcWithoutDada2(alloc, samples.items, &multiqc_without_dada2);
+        if (multiqc_without_dada2.items.len > 0) {
+            logInfo(io, "  WARNING: {d} MultiQC biological samples had no DADA2 match\n", .{multiqc_without_dada2.items.len});
+        }
+        if (unmatched_dada2.items.len > 0) {
+            logInfo(io, "  WARNING: {d} DADA2 IDs not matched in MultiQC\n", .{unmatched_dada2.items.len});
+        }
+        if (duplicate_dada2.items.len > 0) {
+            logInfo(io, "  WARNING: {d} duplicate DADA2 IDs skipped\n", .{duplicate_dada2.items.len});
         }
     } else {
         logInfo(io, "No DADA2 stats -- MultiQC-only mode.\n", .{});
@@ -1216,9 +1638,15 @@ pub fn main(init: std.process.Init) !void {
     assignFlags(samples.items, cfg);
     assignRecommendations(samples.items);
 
+    const diag = JoinDiagnostics{
+        .multiqc_without_dada2 = multiqc_without_dada2.items,
+        .unmatched_dada2 = unmatched_dada2.items,
+        .duplicate_dada2 = duplicate_dada2.items,
+    };
+
     logInfo(io, "Writing outputs: {s}.*\n", .{prefix_path});
-    try writeStdout(io, samples.items, cfg, has_dada2, unmatched.items);
-    try writeMarkdown(io, alloc, samples.items, cfg, has_dada2, unmatched.items, gs_path, fq_path, d2_path, prefix_path);
+    try writeStdout(io, samples.items, cfg, has_dada2, diag);
+    try writeMarkdown(io, alloc, samples.items, cfg, has_dada2, diag, gs_path, fq_path, d2_path, prefix_path);
     try writeSamplesTsv(io, alloc, samples.items, has_dada2, prefix_path);
     try writeFlagsTsv(io, alloc, samples.items, has_dada2, prefix_path);
 
