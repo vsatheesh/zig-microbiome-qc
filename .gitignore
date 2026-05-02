@@ -24,3 +24,6 @@ zig-cache/
 *.sam
 *.qza
 *.qzv
+
+# Claude
+.claude/
