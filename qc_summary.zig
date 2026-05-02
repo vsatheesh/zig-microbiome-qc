@@ -357,7 +357,7 @@ fn parseTsv(
             error.StreamTooLong => continue,
         };
         const raw = maybe_line orelse break;
-        const line = std.mem.trimRight(u8, raw, "\r\n");
+        const line = std.mem.trimEnd(u8, raw, "\r\n");
         if (std.mem.trim(u8, line, " \t").len == 0) continue;
 
         var fields: Row = .empty;
