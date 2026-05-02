@@ -323,6 +323,14 @@ test "normalize common MultiQC and FASTQ sample IDs" {
     try std.testing.expectEqual(ReadSide.unknown, single.read_side);
 }
 
+test "R1 and R2 normalize to the same base sample ID" {
+    const norm_r1 = normalizeSampleId("sampleA_R1.fastq.gz");
+    const norm_r2 = normalizeSampleId("sampleA_R2.fastq.gz");
+    try std.testing.expectEqualStrings(norm_r1.base, norm_r2.base);
+    try std.testing.expectEqual(ReadSide.r1, norm_r1.read_side);
+    try std.testing.expectEqual(ReadSide.r2, norm_r2.read_side);
+}
+
 fn divSafe(a: f64, b: f64) f64 {
     if (b == 0.0 or b == NA_F64 or a == NA_F64) return NA_F64;
     return a / b;
@@ -398,6 +406,17 @@ fn requireColumn(col_map: *const std.StringHashMap(usize), path: []const u8, nam
     return error.MissingRequiredColumn;
 }
 
+fn validateRequiredColumns(col_map: *const std.StringHashMap(usize), path: []const u8, required: []const []const u8) !void {
+    var n_missing: usize = 0;
+    for (required) |name| {
+        if (!col_map.contains(name)) {
+            std.debug.print("ERROR: {s}: missing required column '{s}'\n", .{ path, name });
+            n_missing += 1;
+        }
+    }
+    if (n_missing > 0) return error.MissingRequiredColumn;
+}
+
 fn requireDada2IdColumn(col_map: *const std.StringHashMap(usize), path: []const u8) ![]const u8 {
     if (col_map.contains("sample-id")) return "sample-id";
     if (col_map.contains("sample_id")) return "sample_id";
@@ -456,7 +475,7 @@ fn parseGeneralStats(
     try parseTsv(io, alloc, path, &headers, &rows);
     var col = try buildColIndex(alloc, headers.items);
     defer col.deinit();
-    try requireColumn(&col, path, "Sample");
+    try validateRequiredColumns(&col, path, &[_][]const u8{"Sample"});
 
     for (rows.items, 0..) |row, row_i| {
         if (row.items.len == 0) continue;
@@ -506,7 +525,7 @@ fn parseFastqcStats(
     try parseTsv(io, alloc, path, &headers, &rows);
     var col = try buildColIndex(alloc, headers.items);
     defer col.deinit();
-    try requireColumn(&col, path, "Sample");
+    try validateRequiredColumns(&col, path, &[_][]const u8{"Sample"});
 
     for (rows.items, 0..) |row, row_i| {
         if (row.items.len == 0) continue;
@@ -677,7 +696,7 @@ fn parseDada2Stats(
 
     const id_col = try requireDada2IdColumn(&col, path);
     const required_counts = [_][]const u8{ "input", "filtered", "denoised", "merged", "non-chimeric" };
-    for (required_counts) |name| try requireColumn(&col, path, name);
+    try validateRequiredColumns(&col, path, &required_counts);
 
     for (rows.items, 0..) |row, row_i| {
         if (row.items.len == 0) continue;
@@ -802,6 +821,27 @@ fn assignRecommendations(samples: []SampleRecord) void {
             s.recommendation = .review_manually;
         } else {
             s.recommendation = .continue_analysis;
+        }
+    }
+}
+
+fn validateDada2Monotonic(io: Io, samples: []const SampleRecord) void {
+    for (samples) |s| {
+        if (!s.has_dada2) continue;
+        var violated = false;
+        if (s.dada2_input != NA_U64 and s.dada2_filtered != NA_U64 and s.dada2_input < s.dada2_filtered) violated = true;
+        if (s.dada2_filtered != NA_U64 and s.dada2_denoised != NA_U64 and s.dada2_filtered < s.dada2_denoised) violated = true;
+        if (s.dada2_denoised != NA_U64 and s.dada2_merged != NA_U64 and s.dada2_denoised < s.dada2_merged) violated = true;
+        if (s.dada2_merged != NA_U64 and s.dada2_non_chimeric != NA_U64 and s.dada2_merged < s.dada2_non_chimeric) violated = true;
+        if (violated) {
+            logInfo(io, "  WARNING: non-monotonic DADA2 counts for '{s}': input={d} filtered={d} denoised={d} merged={d} non_chimeric={d}\n", .{
+                s.id,
+                if (s.dada2_input == NA_U64) @as(u64, 0) else s.dada2_input,
+                if (s.dada2_filtered == NA_U64) @as(u64, 0) else s.dada2_filtered,
+                if (s.dada2_denoised == NA_U64) @as(u64, 0) else s.dada2_denoised,
+                if (s.dada2_merged == NA_U64) @as(u64, 0) else s.dada2_merged,
+                if (s.dada2_non_chimeric == NA_U64) @as(u64, 0) else s.dada2_non_chimeric,
+            });
         }
     }
 }
@@ -980,6 +1020,22 @@ fn writeStdout(io: Io, samples: []const SampleRecord, cfg: Config, has_dada2: bo
         try w.print("  Microbiome usability assessment incomplete.\n", .{});
     }
 
+    if (has_dada2) {
+        const n_matched = n - c.n_mqc_only;
+        try w.print("\n-- DADA2 SAMPLE COVERAGE --\n", .{});
+        try w.print("  Matched (both MultiQC + DADA2): {d}\n", .{n_matched});
+        if (diag.multiqc_without_dada2.len > 0) {
+            try w.print("  WARNING: MultiQC only (no DADA2 match): {d}\n", .{diag.multiqc_without_dada2.len});
+        } else {
+            try w.print("  MultiQC only (no DADA2 match): 0\n", .{});
+        }
+        if (diag.unmatched_dada2.len > 0) {
+            try w.print("  WARNING: DADA2 only (no MultiQC match): {d}\n", .{diag.unmatched_dada2.len});
+        } else {
+            try w.print("  DADA2 only (no MultiQC match): 0\n", .{});
+        }
+    }
+
     try w.print("\n-- DEPTH CLASSIFICATION --\n", .{});
     if (has_dada2) {
         try w.print("  PASS_STRONG     (>={d}): {d}  ({d:.1}%)\n", .{ cfg.pass_strong, c.n_strong, pct(c.n_strong, n) });
@@ -1075,6 +1131,21 @@ fn writeMarkdown(
     try w.print("**MultiQC file rows aggregated:** {d}\n\n", .{n_files});
 
     if (has_dada2) {
+        const n_matched = n - c.n_mqc_only;
+        try w.print("### DADA2 Sample Coverage\n\n", .{});
+        try w.print("| Set | Count |\n|---|---:|\n", .{});
+        try w.print("| Matched (MultiQC + DADA2) | {d} |\n", .{n_matched});
+        if (diag.multiqc_without_dada2.len > 0) {
+            try w.print("| **WARNING** MultiQC only (no DADA2 match) | {d} |\n", .{diag.multiqc_without_dada2.len});
+        } else {
+            try w.print("| MultiQC only (no DADA2 match) | 0 |\n", .{});
+        }
+        if (diag.unmatched_dada2.len > 0) {
+            try w.print("| **WARNING** DADA2 only (no MultiQC match) | {d} |\n", .{diag.unmatched_dada2.len});
+        } else {
+            try w.print("| DADA2 only (no MultiQC match) | 0 |\n", .{});
+        }
+        try w.print("\n", .{});
         try w.print("### Depth Classification (non-chimeric reads)\n\n", .{});
         try w.print("| Classification | Threshold | Count | Pct |\n|---|---|---:|---:|\n", .{});
         try w.print("| PASS_STRONG | >={d} | {d} | {d:.1}% |\n", .{ cfg.pass_strong, c.n_strong, pct(c.n_strong, n) });
@@ -1629,6 +1700,7 @@ pub fn main(init: std.process.Init) !void {
         if (duplicate_dada2.items.len > 0) {
             logInfo(io, "  WARNING: {d} duplicate DADA2 IDs skipped\n", .{duplicate_dada2.items.len});
         }
+        validateDada2Monotonic(io, samples.items);
     } else {
         logInfo(io, "No DADA2 stats -- MultiQC-only mode.\n", .{});
     }
