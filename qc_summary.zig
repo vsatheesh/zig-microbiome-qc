@@ -1513,7 +1513,7 @@ fn printHelp(io: Io) void {
     w.flush() catch {};
 }
 
-fn parseArgs(io: Io, alloc: Allocator, args: []const [:0]const u8) !Config {
+fn parseArgs(io: Io, args: []const [:0]const u8) !Config {
     var cfg = Config{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -1538,13 +1538,13 @@ fn parseArgs(io: Io, alloc: Allocator, args: []const [:0]const u8) !Config {
                 }
                 const val = args[i];
                 if (std.mem.eql(u8, flag, "--multiqc-general-stats")) {
-                    cfg.multiqc_general_stats = try alloc.dupe(u8, val);
+                    cfg.multiqc_general_stats = val;
                 } else if (std.mem.eql(u8, flag, "--multiqc-fastqc")) {
-                    cfg.multiqc_fastqc = try alloc.dupe(u8, val);
+                    cfg.multiqc_fastqc = val;
                 } else if (std.mem.eql(u8, flag, "--dada2-stats")) {
-                    cfg.dada2_stats = try alloc.dupe(u8, val);
+                    cfg.dada2_stats = val;
                 } else if (std.mem.eql(u8, flag, "--out-prefix")) {
-                    cfg.out_prefix = try alloc.dupe(u8, val);
+                    cfg.out_prefix = val;
                 } else if (std.mem.eql(u8, flag, "--pass-strong")) {
                     cfg.pass_strong = std.fmt.parseInt(u64, val, 10) catch {
                         std.debug.print("ERROR: bad --pass-strong\n", .{});
@@ -1629,7 +1629,7 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
-    const cfg = try parseArgs(io, alloc, args);
+    const cfg = try parseArgs(io, args);
 
     const gs_path = try resolvePath(io, alloc, cfg.multiqc_general_stats);
     defer alloc.free(gs_path);
