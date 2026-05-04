@@ -1595,7 +1595,10 @@ fn parseArgs(io: Io, args: []const [:0]const u8) !Config {
                 break;
             }
         }
-        if (!matched) std.debug.print("WARNING: unknown argument ignored: {s}\n", .{arg});
+        if (!matched) {
+            std.debug.print("ERROR: unknown argument: {s}\n", .{arg});
+            std.process.exit(1);
+        }
     }
 
     if (cfg.multiqc_general_stats.len == 0) {
