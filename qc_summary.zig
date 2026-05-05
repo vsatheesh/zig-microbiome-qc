@@ -1616,7 +1616,7 @@ fn parseArgs(io: Io, args: []const [:0]const u8) !Config {
 
 fn resolvePath(io: Io, alloc: Allocator, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return alloc.dupe(u8, path);
-    var cwd_buf: [std.fs.Dir.max_path_bytes]u8 = undefined;
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const len = std.process.currentPath(io, &cwd_buf) catch return alloc.dupe(u8, path);
     const cwd = cwd_buf[0..len];
     return std.fs.path.join(alloc, &.{ cwd, path });
