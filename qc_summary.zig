@@ -668,6 +668,42 @@ test "aggregate paired MultiQC rows into one biological sample" {
     try std.testing.expectEqual(@as(u8, 2), s.per_base_seq_quality);
 }
 
+test "_R1 and _R2 raw IDs produce one merged biological sample" {
+    const alloc = std.testing.allocator;
+
+    const raw_ids = [_]struct { id: []const u8, side: ReadSide }{
+        .{ .id = "sampleX_R1.fastq.gz", .side = .r1 },
+        .{ .id = "sampleX_R2.fastq.gz", .side = .r2 },
+    };
+
+    var rows: AL(MultiqcFileRow) = .empty;
+    defer rows.deinit(alloc);
+    for (raw_ids) |entry| {
+        const norm = normalizeSampleId(entry.id);
+        try rows.append(alloc, MultiqcFileRow{
+            .id = entry.id,
+            .base_id = norm.base,
+            .read_side = norm.read_side,
+            .total_sequences = 1000.0,
+        });
+    }
+
+    var samples: AL(SampleRecord) = .empty;
+    defer {
+        for (samples.items) |s| alloc.free(s.id);
+        samples.deinit(alloc);
+    }
+    var sample_map = std.StringHashMap(usize).init(alloc);
+    defer sample_map.deinit();
+
+    try aggregateMultiqcRows(alloc, rows.items, &samples, &sample_map);
+    try std.testing.expectEqual(@as(usize, 1), samples.items.len);
+    try std.testing.expectEqualStrings("sampleX", samples.items[0].id);
+    try std.testing.expect(samples.items[0].seen_r1);
+    try std.testing.expect(samples.items[0].seen_r2);
+    try std.testing.expectApproxEqAbs(@as(f64, 2000.0), samples.items[0].total_sequences, 0.001);
+}
+
 fn parseDada2Stats(
     io: Io,
     alloc: Allocator,
