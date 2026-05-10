@@ -218,6 +218,28 @@ fn parseU64fromField(s: []const u8) u64 {
     return std.fmt.parseInt(u64, t, 10) catch NA_U64;
 }
 
+fn parseU64Validated(s: []const u8, sample_id: []const u8, field: []const u8) u64 {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (t.len == 0 or std.mem.eql(u8, t, "N/A") or std.mem.eql(u8, t, "NA")) return NA_U64;
+    if (std.fmt.parseFloat(f64, t)) |f| {
+        if (f >= 0.0) return @as(u64, @intFromFloat(f));
+        return NA_U64;
+    } else |_| {}
+    return std.fmt.parseInt(u64, t, 10) catch {
+        std.debug.print("WARNING: non-numeric value '{s}' for field '{s}' in sample '{s}'\n", .{ t, field, sample_id });
+        return NA_U64;
+    };
+}
+
+fn parseF64Validated(s: []const u8, sample_id: []const u8, field: []const u8) f64 {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (t.len == 0 or std.mem.eql(u8, t, "N/A") or std.mem.eql(u8, t, "NA")) return NA_F64;
+    return std.fmt.parseFloat(f64, t) catch {
+        std.debug.print("WARNING: non-numeric value '{s}' for field '{s}' in sample '{s}'\n", .{ t, field, sample_id });
+        return NA_F64;
+    };
+}
+
 fn parseStatus(s: []const u8) u8 {
     const t = std.mem.trim(u8, s, " \t\r\n");
     if (std.mem.eql(u8, t, "pass")) return 0;
@@ -466,6 +488,8 @@ fn parseTsv(
         if (std.mem.trim(u8, line, " \t").len == 0) continue;
 
         var fields: Row = .empty;
+        // Split on tab only; fields are stored verbatim (no trimming) to
+        // preserve exact TSV column boundaries.
         var it = std.mem.splitScalar(u8, line, '\t');
         while (it.next()) |field| {
             try fields.append(alloc, try alloc.dupe(u8, field));
@@ -588,11 +612,11 @@ fn parseGeneralStats(
             .read_side = norm.read_side,
         };
         r.pct_duplicates = parseF64(getField(row.items, &col, "percent_duplicates"));
-        r.pct_gc = parseF64(getField(row.items, &col, "percent_gc"));
+        r.pct_gc = parseF64Validated(getField(row.items, &col, "percent_gc"), raw_id, "percent_gc");
         r.avg_seq_len = parseF64(getField(row.items, &col, "avg_sequence_length"));
         r.median_seq_len = parseF64(getField(row.items, &col, "median_sequence_length"));
         r.pct_fails = parseF64(getField(row.items, &col, "percent_fails"));
-        r.total_sequences = parseF64(getField(row.items, &col, "total_sequences"));
+        r.total_sequences = parseF64Validated(getField(row.items, &col, "total_sequences"), raw_id, "total_sequences");
         const idx = file_rows.items.len;
         try file_rows.append(alloc, r);
         try file_map.put(file_rows.items[idx].id, idx);
@@ -801,6 +825,46 @@ test "_R1 and _R2 raw IDs produce one merged biological sample" {
     try std.testing.expectApproxEqAbs(@as(f64, 2000.0), samples.items[0].total_sequences, 0.001);
 }
 
+test "parseU64Validated returns NA and warns on malformed value" {
+    // Non-numeric string → NA sentinel (warning printed to stderr).
+    try std.testing.expectEqual(NA_U64, parseU64Validated("not_a_number", "sample_bad", "input"));
+    // Valid integers and float-encoded counts still parse correctly.
+    try std.testing.expectEqual(@as(u64, 100), parseU64Validated("100", "s", "input"));
+    try std.testing.expectEqual(@as(u64, 90), parseU64Validated("90.0", "s", "filtered"));
+    // Empty / NA sentinels remain silent NA.
+    try std.testing.expectEqual(NA_U64, parseU64Validated("", "s", "input"));
+    try std.testing.expectEqual(NA_U64, parseU64Validated("NA", "s", "input"));
+}
+
+test "applyDada2 warns on malformed numeric field and continues processing" {
+    const alloc = std.testing.allocator;
+    var col = std.StringHashMap(usize).init(alloc);
+    defer col.deinit();
+    try col.put("input", 0);
+    try col.put("filtered", 1);
+    try col.put("denoised", 2);
+    try col.put("merged", 3);
+    try col.put("non-chimeric", 4);
+
+    // Build a mutable row ([]u8 elements) so applyDada2's type matches.
+    const strs = [_][]const u8{ "not_a_number", "100", "90", "80", "70" };
+    var row: [5][]u8 = undefined;
+    for (strs, 0..) |s, i| row[i] = try alloc.dupe(u8, s);
+    defer for (row) |f| alloc.free(f);
+
+    var s = SampleRecord{ .id = "sample_bad" };
+
+    // Emits a warning to stderr for "input"; all other fields parse correctly.
+    applyDada2(row[0..], &col, &s, "sample_bad");
+
+    try std.testing.expect(s.has_dada2);
+    try std.testing.expectEqual(NA_U64, s.dada2_input);
+    try std.testing.expectEqual(@as(u64, 100), s.dada2_filtered);
+    try std.testing.expectEqual(@as(u64, 90), s.dada2_denoised);
+    try std.testing.expectEqual(@as(u64, 80), s.dada2_merged);
+    try std.testing.expectEqual(@as(u64, 70), s.dada2_non_chimeric);
+}
+
 fn parseDada2Stats(
     io: Io,
     alloc: Allocator,
@@ -855,20 +919,20 @@ fn parseDada2Stats(
                 try duplicate_dada2.append(alloc, try alloc.dupe(u8, raw_id));
                 continue;
             }
-            applyDada2(row.items, &col, s);
+            applyDada2(row.items, &col, s, raw_id);
         } else {
             try unmatched_dada2.append(alloc, try alloc.dupe(u8, raw_id));
         }
     }
 }
 
-fn applyDada2(row: []const []u8, col: *const std.StringHashMap(usize), s: *SampleRecord) void {
+fn applyDada2(row: []const []u8, col: *const std.StringHashMap(usize), s: *SampleRecord, sample_id: []const u8) void {
     s.has_dada2 = true;
-    s.dada2_input = parseU64fromField(getField(row, col, "input"));
-    s.dada2_filtered = parseU64fromField(getField(row, col, "filtered"));
-    s.dada2_denoised = parseU64fromField(getField(row, col, "denoised"));
-    s.dada2_merged = parseU64fromField(getField(row, col, "merged"));
-    s.dada2_non_chimeric = parseU64fromField(getField(row, col, "non-chimeric"));
+    s.dada2_input = parseU64Validated(getField(row, col, "input"), sample_id, "input");
+    s.dada2_filtered = parseU64Validated(getField(row, col, "filtered"), sample_id, "filtered");
+    s.dada2_denoised = parseU64Validated(getField(row, col, "denoised"), sample_id, "denoised");
+    s.dada2_merged = parseU64Validated(getField(row, col, "merged"), sample_id, "merged");
+    s.dada2_non_chimeric = parseU64Validated(getField(row, col, "non-chimeric"), sample_id, "non-chimeric");
 }
 
 fn collectMultiqcWithoutDada2(alloc: Allocator, samples: []const SampleRecord, out: *AL([]u8)) !void {
