@@ -21,6 +21,7 @@ const Config = struct {
     multiqc_general_stats: []const u8 = "",
     multiqc_fastqc: []const u8 = "",
     dada2_stats: []const u8 = "",
+    manifest: []const u8 = "",
     out_prefix: []const u8 = "microbiome_qc_summary",
     pass_strong: u64 = 20_000,
     pass_acceptable: u64 = 10_000,
@@ -334,6 +335,102 @@ test "R1 and R2 normalize to the same base sample ID" {
 fn divSafe(a: f64, b: f64) f64 {
     if (b == 0.0 or b == NA_F64 or a == NA_F64) return NA_F64;
     return a / b;
+}
+
+// Strip trailing -R<digits> from manifest sample-ids (e.g. "Sample_1-R2" -> "Sample_1").
+fn stripManifestReplicateSuffix(id: []const u8) []const u8 {
+    var i: usize = id.len;
+    while (i > 0 and isDigit(id[i - 1])) i -= 1;
+    if (i > 0 and id[i - 1] == 'R') i -= 1;
+    if (i > 0 and id[i - 1] == '-') return id[0 .. i - 1];
+    return id;
+}
+
+test "stripManifestReplicateSuffix" {
+    try std.testing.expectEqualStrings("Sample_1", stripManifestReplicateSuffix("Sample_1-R1"));
+    try std.testing.expectEqualStrings("Sample_10", stripManifestReplicateSuffix("Sample_10-R2"));
+    try std.testing.expectEqualStrings("Sample_1", stripManifestReplicateSuffix("Sample_1"));
+}
+
+// Parse a QIIME2-style manifest CSV (sample-id,absolute-filepath,direction).
+// Builds a map from file-stem -> DADA2 sample ID (manifest sample-id with -R<N> stripped).
+fn parseManifestCsv(
+    io: Io,
+    alloc: Allocator,
+    path: []const u8,
+    out: *std.StringHashMap([]u8),
+) !void {
+    const file = Io.Dir.openFileAbsolute(io, path, .{}) catch |err| {
+        std.debug.print("ERROR: Cannot open manifest: {s} ({any})\n", .{ path, err });
+        return err;
+    };
+    defer file.close(io);
+
+    var read_buf: [131072]u8 = undefined;
+    var rdr = file.reader(io, &read_buf);
+    var first_line = true;
+    var sample_id_col: usize = 0;
+    var filepath_col: usize = 1;
+
+    while (true) {
+        const maybe_line = rdr.interface.takeDelimiter('\n') catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+            error.StreamTooLong => continue,
+        };
+        const raw = maybe_line orelse break;
+        const line = std.mem.trimEnd(u8, raw, "\r\n");
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+
+        var fields_buf: [8][]const u8 = undefined;
+        var n_fields: usize = 0;
+        var it = std.mem.splitScalar(u8, line, ',');
+        while (it.next()) |f| {
+            if (n_fields < fields_buf.len) {
+                fields_buf[n_fields] = f;
+                n_fields += 1;
+            }
+        }
+        if (n_fields == 0) continue;
+
+        if (first_line) {
+            first_line = false;
+            for (fields_buf[0..n_fields], 0..) |h, i| {
+                const hh = std.mem.trim(u8, h, " \t\r\n");
+                if (std.mem.eql(u8, hh, "sample-id") or std.mem.eql(u8, hh, "sample_id")) sample_id_col = i;
+                if (std.mem.eql(u8, hh, "absolute-filepath") or std.mem.eql(u8, hh, "filepath") or std.mem.eql(u8, hh, "file-path")) filepath_col = i;
+            }
+            continue;
+        }
+
+        if (n_fields <= sample_id_col or n_fields <= filepath_col) continue;
+
+        const manifest_sample_id = std.mem.trim(u8, fields_buf[sample_id_col], " \t\r\n");
+        const filepath = std.mem.trim(u8, fields_buf[filepath_col], " \t\r\n");
+        if (manifest_sample_id.len == 0 or filepath.len == 0) continue;
+
+        const basename = std.fs.path.basename(filepath);
+        const file_stem = stripKnownFileSuffixes(basename);
+        const dada2_id = stripManifestReplicateSuffix(manifest_sample_id);
+
+        if (out.contains(file_stem)) continue;
+        const key = try alloc.dupe(u8, file_stem);
+        const val = try alloc.dupe(u8, dada2_id);
+        try out.put(key, val);
+    }
+}
+
+// Replace each file row's base_id with the DADA2 sample ID from the manifest map.
+fn remapBaseIdsWithManifest(
+    alloc: Allocator,
+    file_rows: []MultiqcFileRow,
+    manifest_map: *const std.StringHashMap([]u8),
+) !void {
+    for (file_rows) |*row| {
+        if (manifest_map.get(row.id)) |mapped_id| {
+            alloc.free(row.base_id);
+            row.base_id = try alloc.dupe(u8, mapped_id);
+        }
+    }
 }
 
 // ============================================================
@@ -741,9 +838,18 @@ fn parseDada2Stats(
             std.debug.print("ERROR: {s}: missing DADA2 sample id on data row {d}\n", .{ path, row_i + 2 });
             return error.MissingRequiredValue;
         }
-        const norm = normalizeSampleId(raw_id);
+        // Skip QIIME2 metadata directive rows (e.g. "#q2:types").
+        if (std.mem.startsWith(u8, raw_id, "#")) continue;
 
-        if (sample_map.get(norm.base)) |idx| {
+        // Try exact match first (needed when manifest has already remapped base IDs to
+        // DADA2-style IDs like "Sample_1"), then fall back to normalized match so that
+        // stripping R1/R2 suffixes still works for the no-manifest code path.
+        const idx_opt = sample_map.get(raw_id) orelse blk: {
+            const norm = normalizeSampleId(raw_id);
+            break :blk sample_map.get(norm.base);
+        };
+
+        if (idx_opt) |idx| {
             const s = &samples[idx];
             if (s.has_dada2) {
                 try duplicate_dada2.append(alloc, try alloc.dupe(u8, raw_id));
@@ -1531,6 +1637,11 @@ fn printHelp(io: Io) void {
         \\  --dada2-stats <path>             DADA2 denoising stats TSV
         \\                                   (columns: sample-id, input, filtered,
         \\                                    denoised, merged, non-chimeric)
+        \\  --manifest <path>                QIIME2 manifest CSV for filename->sample-id mapping
+        \\                                   (columns: sample-id, absolute-filepath, direction)
+        \\                                   Maps MultiQC filenames to DADA2 sample IDs by
+        \\                                   stripping the -R<N> replicate suffix from manifest
+        \\                                   sample-ids (e.g. Sample_1-R1 -> Sample_1)
         \\  --out-prefix <prefix>            Output prefix (default: microbiome_qc_summary)
         \\
         \\Thresholds:
@@ -1559,10 +1670,10 @@ fn parseArgs(io: Io, args: []const [:0]const u8) !Config {
             std.process.exit(0);
         }
         const flags = [_][]const u8{
-            "--multiqc-general-stats", "--multiqc-fastqc",  "--dada2-stats",       "--out-prefix",
-            "--pass-strong",           "--pass-acceptable", "--low-depth",         "--low-retention",
-            "--poor-merging",          "--high-chimera",    "--very-low-filtered", "--high-dup-pct",
-            "--gc-outlier-sd",
+            "--multiqc-general-stats", "--multiqc-fastqc",  "--dada2-stats",       "--manifest",
+            "--out-prefix",            "--pass-strong",     "--pass-acceptable",   "--low-depth",
+            "--low-retention",         "--poor-merging",    "--high-chimera",      "--very-low-filtered",
+            "--high-dup-pct",          "--gc-outlier-sd",
         };
         var matched = false;
         for (flags) |flag| {
@@ -1579,6 +1690,8 @@ fn parseArgs(io: Io, args: []const [:0]const u8) !Config {
                     cfg.multiqc_fastqc = val;
                 } else if (std.mem.eql(u8, flag, "--dada2-stats")) {
                     cfg.dada2_stats = val;
+                } else if (std.mem.eql(u8, flag, "--manifest")) {
+                    cfg.manifest = val;
                 } else if (std.mem.eql(u8, flag, "--out-prefix")) {
                     cfg.out_prefix = val;
                 } else if (std.mem.eql(u8, flag, "--pass-strong")) {
@@ -1676,6 +1789,8 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(fq_path);
     const d2_path = if (cfg.dada2_stats.len > 0) try resolvePath(io, alloc, cfg.dada2_stats) else try alloc.dupe(u8, "");
     defer alloc.free(d2_path);
+    const manifest_path = if (cfg.manifest.len > 0) try resolvePath(io, alloc, cfg.manifest) else try alloc.dupe(u8, "");
+    defer alloc.free(manifest_path);
     const prefix_path = try resolvePath(io, alloc, cfg.out_prefix);
     defer alloc.free(prefix_path);
 
@@ -1698,6 +1813,23 @@ pub fn main(init: std.process.Init) !void {
 
     logInfo(io, "Parsing: {s}\n", .{fq_path});
     try parseFastqcStats(io, alloc, fq_path, &file_map, &file_rows);
+
+    if (manifest_path.len > 0) {
+        logInfo(io, "Parsing manifest: {s}\n", .{manifest_path});
+        var manifest_map = std.StringHashMap([]u8).init(alloc);
+        defer {
+            var mit = manifest_map.iterator();
+            while (mit.next()) |entry| {
+                alloc.free(entry.key_ptr.*);
+                alloc.free(entry.value_ptr.*);
+            }
+            manifest_map.deinit();
+        }
+        try parseManifestCsv(io, alloc, manifest_path, &manifest_map);
+        logInfo(io, "  -> {d} file-stem -> sample-id mappings loaded\n", .{manifest_map.count()});
+        try remapBaseIdsWithManifest(alloc, file_rows.items, &manifest_map);
+        logInfo(io, "  -> base IDs remapped via manifest\n", .{});
+    }
 
     var samples: AL(SampleRecord) = .empty;
     defer {
